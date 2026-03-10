@@ -1,13 +1,13 @@
 """
 BlackRoad LocalAI - Local AI model runner and router
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 import sqlite3
 import os
-import json
 import time
+import requests
 from pathlib import Path
 
 
@@ -74,7 +74,10 @@ class LocalAI:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute("SELECT name, provider, endpoint, context_len, supports_vision, supports_tools, cost_per_token FROM models")
+        cursor.execute(
+            "SELECT name, provider, endpoint, context_len, "
+            "supports_vision, supports_tools, cost_per_token FROM models"
+        )
         for row in cursor.fetchall():
             name, provider, endpoint, context_len, supports_vision, supports_tools, cost_per_token = row
             self.models[name] = ModelConfig(
@@ -140,56 +143,138 @@ class LocalAI:
         
         return True
     
-    def chat(self, model: str, messages: List[Dict], temperature: float = 0.7, 
+    def chat(self, model: str, messages: List[Dict], temperature: float = 0.7,
              max_tokens: int = 2048) -> Optional[str]:
         """Unified chat interface"""
         if model not in self.models:
             return None
-        
+
         config = self.models[model]
         start_time = time.time()
-        
-        # Mock response routing based on provider
-        if config.provider == "ollama":
-            response = f"[{model}] Response to: {messages[-1].get('content', 'hello')}"
-        elif config.provider == "llamacpp":
-            response = f"[llama.cpp] Response to: {messages[-1].get('content', 'hello')}"
-        elif config.provider == "lmstudio":
-            response = f"[LM Studio] Response to: {messages[-1].get('content', 'hello')}"
-        elif config.provider == "vllm":
-            response = f"[vLLM] Response to: {messages[-1].get('content', 'hello')}"
-        else:
-            response = "Unknown provider"
-        
+        response: Optional[str] = None
+
+        try:
+            if config.provider == "ollama":
+                resp = requests.post(
+                    f"{config.endpoint}/api/chat",
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "stream": False,
+                        "options": {"temperature": temperature, "num_predict": max_tokens},
+                    },
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                response = data.get("message", {}).get("content")
+
+            elif config.provider in ("llamacpp", "lmstudio", "vllm"):
+                # These providers expose an OpenAI-compatible API
+                resp = requests.post(
+                    f"{config.endpoint}/v1/chat/completions",
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    },
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                response = data["choices"][0]["message"]["content"]
+
+        except requests.RequestException:
+            return None
+
         latency_ms = int((time.time() - start_time) * 1000)
-        
-        # Log usage
-        self._log_usage(model, "chat", len(response) // 4, latency_ms)
-        
+        if response:
+            self._log_usage(model, "chat", len(response) // 4, latency_ms)
+
         return response
-    
-    def generate(self, model: str, prompt: str, **kwargs) -> Optional[str]:
+
+    def generate(self, model: str, prompt: str, temperature: float = 0.7,
+                 max_tokens: int = 2048) -> Optional[str]:
         """Text generation"""
         if model not in self.models:
             return None
-        
-        start_time = time.time()
+
         config = self.models[model]
-        
-        response = f"[{model}] Generated: {prompt}"
-        
+        start_time = time.time()
+        response: Optional[str] = None
+
+        try:
+            if config.provider == "ollama":
+                resp = requests.post(
+                    f"{config.endpoint}/api/generate",
+                    json={
+                        "model": model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": temperature, "num_predict": max_tokens},
+                    },
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                response = resp.json().get("response")
+
+            elif config.provider in ("llamacpp", "lmstudio", "vllm"):
+                resp = requests.post(
+                    f"{config.endpoint}/v1/completions",
+                    json={
+                        "model": model,
+                        "prompt": prompt,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    },
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                response = resp.json()["choices"][0]["text"]
+
+        except requests.RequestException:
+            return None
+
         latency_ms = int((time.time() - start_time) * 1000)
-        self._log_usage(model, "generate", len(response) // 4, latency_ms)
-        
+        if response:
+            self._log_usage(model, "generate", len(response) // 4, latency_ms)
+
         return response
-    
+
     def embed(self, model: str, text: str) -> Optional[List[float]]:
-        """Get embeddings"""
+        """Get text embeddings"""
         if model not in self.models:
             return None
-        
-        # Mock embeddings - return 384-dim vector for most models
-        return [0.1 + (i % 10) * 0.01 for i in range(384)]
+
+        config = self.models[model]
+
+        try:
+            if config.provider == "ollama":
+                resp = requests.post(
+                    f"{config.endpoint}/api/embed",
+                    json={"model": model, "input": text},
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                embeddings = data.get("embeddings")
+                if embeddings:
+                    return embeddings[0]
+
+            elif config.provider in ("llamacpp", "lmstudio", "vllm"):
+                resp = requests.post(
+                    f"{config.endpoint}/v1/embeddings",
+                    json={"model": model, "input": text},
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                return resp.json()["data"][0]["embedding"]
+
+        except requests.RequestException:
+            return None
+
+        return None
     
     def list_models(self) -> List[Dict]:
         """List all registered models"""
@@ -202,36 +287,55 @@ class LocalAI:
                 'context_len': config.context_len,
                 'supports_vision': config.supports_vision,
                 'supports_tools': config.supports_tools,
-                'status': 'online'  # Mock status
+                'status': 'online' if self.health_check(name) else 'offline',
             })
         return result
-    
+
     def health_check(self, model: str) -> bool:
-        """Check if model endpoint is healthy"""
+        """Check if model endpoint is reachable"""
         if model not in self.models:
             return False
-        
-        # Mock health check
-        return True
+
+        config = self.models[model]
+
+        try:
+            if config.provider == "ollama":
+                resp = requests.get(config.endpoint, timeout=5)
+                return resp.status_code == 200
+            else:
+                # llama.cpp / LM Studio / vLLM expose /health or OpenAI /v1/models
+                try:
+                    resp = requests.get(f"{config.endpoint}/health", timeout=5)
+                    return resp.status_code == 200
+                except requests.RequestException:
+                    resp = requests.get(f"{config.endpoint}/v1/models", timeout=5)
+                    return resp.status_code == 200
+        except requests.RequestException:
+            return False
     
     def benchmark(self, model: str, prompt: str, n: int = 5) -> Optional[Dict]:
         """Benchmark model performance"""
         if model not in self.models:
             return None
-        
+
         latencies = []
         for _ in range(n):
             start = time.time()
-            self.generate(model, prompt)
-            latencies.append((time.time() - start) * 1000)
-        
+            result = self.generate(model, prompt)
+            elapsed = (time.time() - start) * 1000
+            if result is not None:
+                latencies.append(elapsed)
+
+        if not latencies:
+            return None
+
         avg_latency = sum(latencies) / len(latencies)
         tokens_per_sec = 1000 / avg_latency * 100  # Rough estimate
-        
+
         return {
             'avg_latency_ms': avg_latency,
             'tokens_per_sec': tokens_per_sec,
-            'samples': n
+            'samples': len(latencies),
         }
     
     def route_best(self, task_type: str) -> Optional[str]:
@@ -263,6 +367,34 @@ class LocalAI:
         
         return None
     
+    def get_usage_stats(self, model: Optional[str] = None) -> List[Dict]:
+        """Return recent usage log entries, optionally filtered by model"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        if model:
+            cursor.execute(
+                "SELECT model, task_type, tokens, latency_ms, timestamp "
+                "FROM usage_logs WHERE model = ? ORDER BY id DESC LIMIT 100",
+                (model,),
+            )
+        else:
+            cursor.execute(
+                "SELECT model, task_type, tokens, latency_ms, timestamp "
+                "FROM usage_logs ORDER BY id DESC LIMIT 100"
+            )
+        rows = cursor.fetchall()
+        conn.close()
+        return [
+            {
+                "model": r[0],
+                "task_type": r[1],
+                "tokens": r[2],
+                "latency_ms": r[3],
+                "timestamp": r[4],
+            }
+            for r in rows
+        ]
+
     def _log_usage(self, model: str, task_type: str, tokens: int, latency_ms: int):
         """Log model usage"""
         conn = sqlite3.connect(self.db_path)

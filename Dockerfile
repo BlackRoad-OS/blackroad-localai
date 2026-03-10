@@ -1,12 +1,12 @@
-FROM node:20-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --production
-COPY . .
-RUN npm run build --if-present
+FROM python:3.11-slim
 
-FROM node:20-alpine
 WORKDIR /app
-COPY --from=builder /app .
-EXPOSE 3000
-CMD ["node", "src/index.js"]
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]
